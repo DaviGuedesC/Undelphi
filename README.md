@@ -1,6 +1,6 @@
-# Undelphi <p align="center">
+# <p align="center">
   <img src="Undelphi.png" alt="Undelphi Logo" width="180">
-</p>
+</p> Undelphi 
 
 A Java tool (Swing + CLI) that runs Ghidra under the hood to extract forms, SQL queries, and business logic from compiled Delphi (Win32) executables, assisting in the migration to **Vue.js** + **Go** (while translating Oracle queries to PostgreSQL).
 
