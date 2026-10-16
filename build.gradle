@@ -1,0 +1,165 @@
+plugins {
+    id 'application'
+}
+
+group = 'undelphi'
+version = '0.1.0'
+
+def ghidraDir = file(System.getenv('GHIDRA_INSTALL_DIR') ?: findProperty('ghidraInstallDir'))
+if (!new File(ghidraDir, 'Ghidra/application.properties').exists()) {
+    throw new GradleException("Ghidra não encontrado em ${ghidraDir} (ajuste ghidraInstallDir em gradle.properties)")
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+// amostras reais (SQL de rotinas, dados de notas) ficam fora do git; sem elas os testes correspondentes são pulados
+sourceSets.test.resources.srcDir 'src/test/resources-privado'
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Ghidra embutido: jars dos módulos (inclui as dependências de terceiros que o próprio Ghidra distribui)
+    implementation fileTree(dir: new File(ghidraDir, 'Ghidra'), include: [
+        'Framework/*/lib/*.jar',
+        'Features/*/lib/*.jar',
+        'Processors/*/lib/*.jar',
+        'Configurations/*/lib/*.jar',
+    ])
+
+    // perfil de destino (de-para WinThor → Inova) em YAML
+    implementation 'org.yaml:snakeyaml:2.3'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+application {
+    mainClass = 'undelphi.Main'
+}
+
+tasks.named('run') {
+    systemProperty 'undelphi.ghidra', ghidraDir.absolutePath
+    jvmArgs '-Xmx4g'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    // testes de aceite que usam o Ghidra embutido (F3/F4) e o exe da 9860, quando disponível
+    systemProperty 'undelphi.ghidra', ghidraDir.absolutePath
+    maxHeapSize = '4g'
+}
+
+// Não distribuímos zip/tar (os jars do Ghidra têm nomes repetidos entre módulos); o launcher usa o undelphi.args
+['distZip', 'distTar', 'startScripts'].each { name ->
+    tasks.named(name) { enabled = false }
+}
+
+// Arquivo de argumentos para o java (@build/undelphi.args): evita o limite de linha de comando
+// do Windows com os ~200 jars do Ghidra no classpath. Usado pelo undelphi.cmd.
+def launcherArgs = tasks.register('launcherArgs') {
+    def jarFile = tasks.named('jar').flatMap { it.archiveFile }
+    def runtimeCp = configurations.runtimeClasspath
+    def out = layout.buildDirectory.file('undelphi.args')
+    def ghidraPath = ghidraDir.absolutePath
+    inputs.files(runtimeCp)
+    inputs.file(jarFile)
+    outputs.file(out)
+    doLast {
+        def slash = { File f -> f.absolutePath.replace('\\', '/') }
+        def entries = [jarFile.get().asFile] + runtimeCp.files.toList()
+        out.get().asFile.text = [
+            "-Dundelphi.ghidra=\"${ghidraPath.replace('\\', '/')}\"",
+            "-cp \"${entries.collect(slash).join(';')}\"",
+            'undelphi.Main',
+        ].join('\n') + '\n'
+    }
+}
+
+tasks.named('assemble') {
+    finalizedBy launcherArgs
+}
+
+tasks.named('jar') {
+    manifest {
+        attributes('Implementation-Title': 'Undelphi', 'Implementation-Version': project.version)
+    }
+}
+
+// ---------------------------------------------------------------- executável Windows (jpackage)
+//
+// build\exe\Undelphi\Undelphi.exe (interface) e undelphi-cli.exe (linha de comando, com console), com o Java
+// embutido. Os jars do Ghidra não são copiados: o launcher os referencia na instalação do Ghidra (o Ghidra
+// precisa da pasta de instalação de qualquer jeito, para o decompilador nativo e os specs de processador).
+
+def jdkHome = file(System.getenv('JAVA_HOME') ?: System.getProperty('java.home'))
+def exeStage = layout.buildDirectory.dir('jpackage/input')
+
+def stageExe = tasks.register('stageExe', Sync) {
+    from tasks.named('jar')
+    from(configurations.runtimeClasspath) {
+        // só as dependências que não vêm do Ghidra (snakeyaml...)
+        exclude { it.file.absolutePath.startsWith(ghidraDir.absolutePath) }
+    }
+    into exeStage
+}
+
+def launcherJar = tasks.register('launcherJar', Jar) {
+    dependsOn stageExe
+    archiveFileName = 'undelphi-launcher.jar'
+    destinationDirectory = exeStage
+    def runtimeCp = configurations.runtimeClasspath
+    def mainJar = tasks.named('jar').flatMap { it.archiveFileName }
+    inputs.files(runtimeCp)
+    doFirst {
+        def entries = [mainJar.get()]
+        runtimeCp.files.each { File f ->
+            if (f.absolutePath.startsWith(ghidraDir.absolutePath)) {
+                entries << f.toURI().toString() // file:/C:/.../Ghidra/...jar (URL absoluta: o JDK aceita no Class-Path)
+            } else {
+                entries << f.name
+            }
+        }
+        manifest.attributes('Main-Class': 'undelphi.Main', 'Class-Path': entries.join(' '))
+    }
+}
+
+tasks.register('exe', Exec) {
+    group = 'distribution'
+    description = 'Gera build/exe/Undelphi (Undelphi.exe + undelphi-cli.exe) com jpackage.'
+    dependsOn launcherJar
+    def out = layout.buildDirectory.dir('exe')
+    def cliProps = layout.buildDirectory.file('jpackage/undelphi-cli.properties')
+    def ghidraPath = ghidraDir.absolutePath.replace('\\', '/')
+    doFirst {
+        project.delete(out)
+        def props = cliProps.get().asFile
+        props.parentFile.mkdirs()
+        props.text = "win-console=true\nicon=${file('packaging/undelphi.ico').absolutePath.replace('\\', '\\\\')}\n"
+    }
+    executable new File(jdkHome, 'bin/jpackage.exe')
+    args '--type', 'app-image',
+            '--name', 'Undelphi',
+            '--app-version', project.version,
+            '--vendor', 'Undelphi',
+            '--description', 'Delphi Win32 decompiler to Vue.js + Go',
+            '--icon', file('packaging/undelphi.ico').absolutePath,
+            '--input', exeStage.get().asFile.absolutePath,
+            '--main-jar', 'undelphi-launcher.jar',
+            '--main-class', 'undelphi.Main',
+            '--runtime-image', jdkHome.absolutePath,
+            '--java-options', "-Dundelphi.ghidra=${ghidraPath}",
+            '--java-options', '-Xmx4g',
+            '--java-options', '-Dstdout.encoding=UTF-8',
+            '--java-options', '-Dstderr.encoding=UTF-8',
+            '--add-launcher', "undelphi-cli=${cliProps.get().asFile.absolutePath}",
+            '--dest', out.get().asFile.absolutePath
+}

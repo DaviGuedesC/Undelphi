@@ -1,0 +1,23 @@
+# Perfil de destino de exemplo: Oracle da aplicação legada → PostgreSQL.
+# Copie, renomeie e preencha com as tabelas do seu destino. Perfis reais ficam em perfis-privados/ (fora do git).
+# Host, usuário e senha vêm sempre do ambiente; senha escrita aqui é recusada.
+nome: exemplo
+conexao:
+  driver: postgres
+  host: ${PGHOST}
+  porta: ${PGPORT:-5432}
+  banco: ${PGDATABASE}
+  usuario: ${PGUSER}
+  senha: ${PGPASSWORD}
+  schema: public
+escrita: bloqueada          # bloqueada (só leitura) | permitida
+colunas_padrao: minusculas  # colunas não listadas: minusculas | igual | lacuna
+tabelas:
+  PCTABPR:
+    destino: preco
+    colunas:
+      PTABELA1: preco_tabela1
+      VLST: ~               # sem equivalente no destino: vira lacuna
+  PCPRODUT: produto
+funcoes: {}
+sequencias: {}

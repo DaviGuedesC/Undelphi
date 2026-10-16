@@ -1,0 +1,88 @@
+package {{PKG}}
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"{{MODULE}}/undelphirt"
+)
+
+func TestValorProcuraNoFormENaSelecaoSemDiferenciarMaiusculas(t *testing.T) {
+	r := &Requisicao{
+		Form:    map[string]any{"dtaPeriodoInicial": "2026-10-01", "vazio": ""},
+		Selecao: map[string]map[string]any{"dmDadosXML.cdsProdutos": {"CODPROD": 123.0}},
+	}
+	if r.Valor("DTAPERIODOINICIAL") != "2026-10-01" {
+		t.Error("Valor deveria achar o campo do form ignorando maiúsculas")
+	}
+	if r.Valor("codprod") != 123.0 {
+		t.Error("Valor deveria achar o campo na linha selecionada")
+	}
+	if r.Valor("vazio") != nil || r.Valor("inexistente") != nil {
+		t.Error("texto vazio e campo ausente devem virar nil (NULL)")
+	}
+}
+
+func chamar(t *testing.T, mux *http.ServeMux, corpo string) (int, Resposta) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/teste/eventos/btnX", bytes.NewBufferString(corpo))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var resp Resposta
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	return rec.Code, resp
+}
+
+func TestRotaDeEventoSegueOContratoDaTelaVue(t *testing.T) {
+	mux := http.NewServeMux()
+	registrarEvento(mux, "/api/teste/eventos/btnX", func(ctx context.Context, req *Requisicao) (*Resposta, error) {
+		resp := NovaResposta()
+		resp.Mensagem = "ok " + req.Valor("nome").(string)
+		resp.Dados["ds"] = []undelphirt.Map{{"PUNIT": undelphirt.Num("12.5")}}
+		return resp, nil
+	})
+	code, resp := chamar(t, mux, `{"form":{"nome":"teste"},"abas":{},"selecao":{}}`)
+	if code != http.StatusOK || resp.Mensagem != "ok teste" {
+		t.Fatalf("status %d, resposta %+v", code, resp)
+	}
+	linhas := resp.Dados["ds"].([]any)
+	if linhas[0].(map[string]any)["PUNIT"] != 12.5 {
+		t.Errorf("dados: %v", resp.Dados)
+	}
+}
+
+func TestLacunaVira501ERequisicaoInvalida400(t *testing.T) {
+	mux := http.NewServeMux()
+	registrarEvento(mux, "/api/teste/eventos/btnX", func(ctx context.Context, req *Requisicao) (*Resposta, error) {
+		return nil, undelphirt.Lacuna("TDMX.qry", "tabela PCX sem destino")
+	})
+	code, resp := chamar(t, mux, `{"form":{}}`)
+	if code != http.StatusNotImplemented || resp.Erro == "" {
+		t.Errorf("lacuna deveria virar 501 com erro, veio %d %+v", code, resp)
+	}
+	code, _ = chamar(t, mux, `{nao é json`)
+	if code != http.StatusBadRequest {
+		t.Errorf("requisição inválida deveria ser 400, veio %d", code)
+	}
+	if !errors.Is(undelphirt.Lacuna("a", "b"), undelphirt.ErrLacuna) {
+		t.Error("Lacuna deve satisfazer errors.Is(ErrLacuna)")
+	}
+}
+
+func TestRotaDeDadosRepassaAQueryString(t *testing.T) {
+	mux := http.NewServeMux()
+	registrarDados(mux, "/api/teste/dados/ds", func(ctx context.Context, q *Requisicao) (any, error) {
+		return []any{q.Valor("CHAVENFE")}, nil
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/teste/dados/ds?chavenfe=123", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "[\"123\"]\n" {
+		t.Errorf("status %d corpo %q", rec.Code, rec.Body.String())
+	}
+}

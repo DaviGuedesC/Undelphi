@@ -1,0 +1,16 @@
+.gradle/
+build/
+out/
+*.class
+# projetos do Ghidra e amostras proprietárias nunca entram no repositório
+*.gpr
+*.rep/
+*.lock
+*.lock~
+amostras/
+node_modules/
+
+# amostras reais e perfis da empresa: ficam só na máquina de desenvolvimento
+src/test/resources-privado/
+perfis-privados/
+

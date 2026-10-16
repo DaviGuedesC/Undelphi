@@ -1,0 +1,9 @@
+{
+  "name": "undelphi-vue-check",
+  "private": true,
+  "description": "Compila os .vue gerados pelo undelphi com o compilador oficial do Vue (mesma versão do Inova)",
+  "type": "module",
+  "dependencies": {
+    "@vue/compiler-sfc": "3.4.31"
+  }
+}

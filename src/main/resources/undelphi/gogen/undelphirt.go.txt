@@ -1,0 +1,693 @@
+// Código gerado pelo undelphi. NÃO EDITAR: é recriado a cada geração.
+
+// Package undelphirt reproduz em Go a semântica de valores do Oracle usada pelas rotinas
+// convertidas: NULL que se propaga, NUMBER decimal exato (sem erro de ponto flutuante),
+// ROUND "meio para longe do zero", '' igual a NULL e erro em divisão por zero (ORA-01476).
+package undelphirt
+
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// ErrLacuna indica que a rotina depende de algo sem equivalente no destino (tabela sem
+// mapeamento, gravação bloqueada, objeto do Oracle...). A mensagem diz o quê.
+var ErrLacuna = errors.New("lacuna no destino")
+
+// Lacuna devolve um erro que satisfaz errors.Is(err, ErrLacuna).
+func Lacuna(origem, motivo string) error {
+	return fmt.Errorf("%w: %s: %s", ErrLacuna, origem, motivo)
+}
+
+// SQLError é um erro de execução com a mesma causa que daria no Oracle.
+type SQLError struct{ Msg string }
+
+func (e *SQLError) Error() string { return e.Msg }
+
+func fail(format string, a ...any) { panic(&SQLError{Msg: fmt.Sprintf(format, a...)}) }
+
+// Recover converte o panic de um SQLError em erro; usar com defer nas funções geradas.
+func Recover(err *error) {
+	if r := recover(); r != nil {
+		if e, ok := r.(*SQLError); ok {
+			*err = e
+			return
+		}
+		panic(r)
+	}
+}
+
+// Kind é o tipo do valor.
+type Kind uint8
+
+const (
+	KNull Kind = iota
+	KNum
+	KStr
+	KTime
+	KBool
+)
+
+// V é um valor SQL: NULL, número decimal exato, texto, data/hora ou lógico (resultado de comparação).
+type V struct {
+	k Kind
+	n *big.Rat
+	s string
+	t time.Time
+	b bool
+}
+
+// Null é o NULL do SQL.
+var Null = V{}
+
+// Num cria um número a partir do texto decimal ("12.5", "-3", "1e3").
+func Num(text string) V {
+	r, ok := new(big.Rat).SetString(strings.TrimSpace(text))
+	if !ok {
+		fail("ORA-01722: número inválido: %q", text)
+	}
+	return V{k: KNum, n: r}
+}
+
+// Int cria um número inteiro.
+func Int(i int64) V { return V{k: KNum, n: new(big.Rat).SetInt64(i)} }
+
+// Rat cria um número a partir de um big.Rat (copiado).
+func Rat(r *big.Rat) V { return V{k: KNum, n: new(big.Rat).Set(r)} }
+
+// Str cria texto; como no Oracle, texto vazio é NULL.
+func Str(s string) V {
+	if s == "" {
+		return Null
+	}
+	return V{k: KStr, s: s}
+}
+
+// Time cria data/hora.
+func Time(t time.Time) V { return V{k: KTime, t: t} }
+
+// Bool cria um lógico.
+func Bool(b bool) V { return V{k: KBool, b: b} }
+
+// Of converte um valor Go (parâmetro, coluna lida do banco) em V.
+func Of(x any) V {
+	switch v := x.(type) {
+	case nil:
+		return Null
+	case V:
+		return v
+	case *V:
+		if v == nil {
+			return Null
+		}
+		return *v
+	case int:
+		return Int(int64(v))
+	case int32:
+		return Int(int64(v))
+	case int64:
+		return Int(v)
+	case float64:
+		r, _ := new(big.Rat).SetString(fmt.Sprintf("%v", v))
+		if r == nil {
+			fail("número inválido: %v", v)
+		}
+		return V{k: KNum, n: r}
+	case float32:
+		return Of(float64(v))
+	case string:
+		return Str(v)
+	case []byte:
+		s := string(v)
+		if r, ok := new(big.Rat).SetString(s); ok && numericText.MatchString(s) {
+			return V{k: KNum, n: r}
+		}
+		return Str(s)
+	case time.Time:
+		return Time(v)
+	case bool:
+		return Bool(v)
+	case *big.Rat:
+		if v == nil {
+			return Null
+		}
+		return Rat(v)
+	default:
+		return Str(fmt.Sprint(v))
+	}
+}
+
+var numericText = regexp.MustCompile(`^-?\d+(\.\d+)?([eE][-+]?\d+)?$`)
+
+// Kind diz o tipo do valor.
+func (v V) Kind() Kind { return v.k }
+
+// IsNull diz se é NULL.
+func (v V) IsNull() bool { return v.k == KNull }
+
+// Rat devolve o número (nil se não for número).
+func (v V) Rat() *big.Rat {
+	if v.k != KNum {
+		return nil
+	}
+	return new(big.Rat).Set(v.n)
+}
+
+// Text devolve o texto do valor ("" para NULL).
+func (v V) Text() string {
+	switch v.k {
+	case KNull:
+		return ""
+	case KNum:
+		return decimalText(v.n)
+	case KStr:
+		return v.s
+	case KTime:
+		return v.t.Format("2006-01-02 15:04:05")
+	default:
+		if v.b {
+			return "TRUE"
+		}
+		return "FALSE"
+	}
+}
+
+func (v V) String() string {
+	if v.k == KNull {
+		return "NULL"
+	}
+	return v.Text()
+}
+
+// Float64 devolve o número como float64 (para exibir; as contas usam decimal exato).
+func (v V) Float64() float64 {
+	if v.k != KNum {
+		return 0
+	}
+	f, _ := v.n.Float64()
+	return f
+}
+
+// Value permite passar V direto como parâmetro do database/sql.
+func (v V) Value() (driver.Value, error) {
+	switch v.k {
+	case KNull:
+		return nil, nil
+	case KNum:
+		return decimalText(v.n), nil
+	case KStr:
+		return v.s, nil
+	case KTime:
+		return v.t, nil
+	default:
+		return v.b, nil
+	}
+}
+
+// MarshalJSON: NULL → null, número → número JSON exato, texto → string, data → "2006-01-02T15:04:05".
+func (v V) MarshalJSON() ([]byte, error) {
+	switch v.k {
+	case KNull:
+		return []byte("null"), nil
+	case KNum:
+		return []byte(decimalText(v.n)), nil
+	case KBool:
+		if v.b {
+			return []byte("true"), nil
+		}
+		return []byte("false"), nil
+	case KTime:
+		return json.Marshal(v.t.Format("2006-01-02T15:04:05"))
+	default:
+		return json.Marshal(v.s)
+	}
+}
+
+// decimalText escreve o número sem notação científica, com até 38 dígitos de precisão.
+func decimalText(r *big.Rat) string {
+	if r.IsInt() {
+		return r.Num().String()
+	}
+	s := r.FloatString(38)
+	s = strings.TrimRight(s, "0")
+	return strings.TrimSuffix(s, ".")
+}
+
+func num(v V, op string) *big.Rat {
+	switch v.k {
+	case KNum:
+		return v.n
+	case KStr:
+		r, ok := new(big.Rat).SetString(strings.TrimSpace(strings.ReplaceAll(v.s, ",", ".")))
+		if !ok {
+			fail("ORA-01722: número inválido em %s: %q", op, v.s)
+		}
+		return r
+	default:
+		fail("ORA-00932: tipo inconsistente em %s: esperava número", op)
+		return nil
+	}
+}
+
+// ---------------------------------------------------------------- aritmética
+
+func arith(a, b V, op string, f func(x, y *big.Rat) *big.Rat) V {
+	if a.k == KNull || b.k == KNull {
+		return Null
+	}
+	if a.k == KTime && b.k != KTime && (op == "+" || op == "-") {
+		days := num(b, op)
+		d := new(big.Rat).Mul(days, big.NewRat(86400, 1))
+		secs, _ := d.Float64()
+		if op == "-" {
+			secs = -secs
+		}
+		return Time(a.t.Add(time.Duration(secs * float64(time.Second))))
+	}
+	if a.k == KTime && b.k == KTime && op == "-" {
+		diff := a.t.Sub(b.t).Seconds()
+		r, _ := new(big.Rat).SetString(fmt.Sprintf("%.6f", diff/86400))
+		return V{k: KNum, n: r}
+	}
+	return V{k: KNum, n: f(num(a, op), num(b, op))}
+}
+
+// Add soma (número + número, data + dias).
+func Add(a, b V) V {
+	return arith(a, b, "+", func(x, y *big.Rat) *big.Rat { return new(big.Rat).Add(x, y) })
+}
+
+// Sub subtrai (número - número, data - dias, data - data em dias).
+func Sub(a, b V) V {
+	return arith(a, b, "-", func(x, y *big.Rat) *big.Rat { return new(big.Rat).Sub(x, y) })
+}
+
+// Mul multiplica.
+func Mul(a, b V) V {
+	return arith(a, b, "*", func(x, y *big.Rat) *big.Rat { return new(big.Rat).Mul(x, y) })
+}
+
+// Div divide; divisão por zero é erro, como no Oracle (ORA-01476).
+func Div(a, b V) V {
+	return arith(a, b, "/", func(x, y *big.Rat) *big.Rat {
+		if y.Sign() == 0 {
+			fail("ORA-01476: divisor é igual a zero")
+		}
+		return new(big.Rat).Quo(x, y)
+	})
+}
+
+// Neg troca o sinal.
+func Neg(a V) V {
+	if a.k == KNull {
+		return Null
+	}
+	return V{k: KNum, n: new(big.Rat).Neg(num(a, "-"))}
+}
+
+// Concat é o operador || (NULL vira texto vazio, como no Oracle).
+func Concat(a, b V) V { return Str(a.Text() + b.Text()) }
+
+// ---------------------------------------------------------------- comparação e lógica (três valores)
+
+func compare(a, b V, op string) (int, bool) {
+	if a.k == KNull || b.k == KNull {
+		return 0, false
+	}
+	if a.k == KNum || b.k == KNum {
+		return num(a, op).Cmp(num(b, op)), true
+	}
+	if a.k == KTime && b.k == KTime {
+		return a.t.Compare(b.t), true
+	}
+	return strings.Compare(a.Text(), b.Text()), true
+}
+
+func cmp(a, b V, op string, ok func(int) bool) V {
+	c, known := compare(a, b, op)
+	if !known {
+		return Null
+	}
+	return Bool(ok(c))
+}
+
+func Eq(a, b V) V { return cmp(a, b, "=", func(c int) bool { return c == 0 }) }
+func Ne(a, b V) V { return cmp(a, b, "<>", func(c int) bool { return c != 0 }) }
+func Lt(a, b V) V { return cmp(a, b, "<", func(c int) bool { return c < 0 }) }
+func Le(a, b V) V { return cmp(a, b, "<=", func(c int) bool { return c <= 0 }) }
+func Gt(a, b V) V { return cmp(a, b, ">", func(c int) bool { return c > 0 }) }
+func Ge(a, b V) V { return cmp(a, b, ">=", func(c int) bool { return c >= 0 }) }
+
+// And é o AND de três valores (FALSE domina NULL).
+func And(a, b V) V {
+	if (a.k == KBool && !a.b) || (b.k == KBool && !b.b) {
+		return Bool(false)
+	}
+	if a.k == KNull || b.k == KNull {
+		return Null
+	}
+	return Bool(true)
+}
+
+// Or é o OR de três valores (TRUE domina NULL).
+func Or(a, b V) V {
+	if (a.k == KBool && a.b) || (b.k == KBool && b.b) {
+		return Bool(true)
+	}
+	if a.k == KNull || b.k == KNull {
+		return Null
+	}
+	return Bool(false)
+}
+
+// Not é o NOT de três valores.
+func Not(a V) V {
+	if a.k == KNull {
+		return Null
+	}
+	return Bool(!a.b)
+}
+
+// Truth diz se a condição é verdadeira (NULL conta como falso, como no WHERE/IF).
+func Truth(v V) bool { return v.k == KBool && v.b }
+
+// IsNullV é o "x IS NULL".
+func IsNullV(a V) V { return Bool(a.k == KNull) }
+
+// In é o "x IN (...)".
+func In(a V, list ...V) V {
+	unknown := false
+	for _, x := range list {
+		r := Eq(a, x)
+		if Truth(r) {
+			return Bool(true)
+		}
+		if r.k == KNull {
+			unknown = true
+		}
+	}
+	if unknown {
+		return Null
+	}
+	return Bool(false)
+}
+
+// Between é o "x BETWEEN a AND b".
+func Between(x, lo, hi V) V { return And(Ge(x, lo), Le(x, hi)) }
+
+// Like é o "x LIKE padrão" (% e _).
+func Like(x, pattern V) V {
+	if x.k == KNull || pattern.k == KNull {
+		return Null
+	}
+	var sb strings.Builder
+	sb.WriteString("^")
+	for _, r := range pattern.Text() {
+		switch r {
+		case '%':
+			sb.WriteString(".*")
+		case '_':
+			sb.WriteString(".")
+		default:
+			sb.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	sb.WriteString("$")
+	return Bool(regexp.MustCompile("(?s)" + sb.String()).MatchString(x.Text()))
+}
+
+// ---------------------------------------------------------------- funções do Oracle
+
+// Nvl devolve b quando a é NULL.
+func Nvl(a, b V) V {
+	if a.k == KNull {
+		return b
+	}
+	return a
+}
+
+// Coalesce devolve o primeiro não nulo.
+func Coalesce(vs ...V) V {
+	for _, v := range vs {
+		if v.k != KNull {
+			return v
+		}
+	}
+	return Null
+}
+
+// Decode é o DECODE do Oracle: NULL casa com NULL; pares (busca, resultado) e padrão opcional.
+func Decode(x V, args ...V) V {
+	k := 0
+	for ; k+1 < len(args); k += 2 {
+		s := args[k]
+		if (x.k == KNull && s.k == KNull) || Truth(Eq(x, s)) {
+			return args[k+1]
+		}
+	}
+	if k < len(args) {
+		return args[k]
+	}
+	return Null
+}
+
+// Round arredonda com n casas, meio para longe do zero (ROUND do Oracle). Sem n: 0 casas.
+func Round(x V, n ...V) V {
+	if x.k == KNull {
+		return Null
+	}
+	places := int64(0)
+	if len(n) > 0 {
+		if n[0].k == KNull {
+			return Null
+		}
+		p := num(n[0], "ROUND")
+		places = new(big.Int).Quo(p.Num(), p.Denom()).Int64()
+	}
+	return V{k: KNum, n: roundRat(num(x, "ROUND"), places, true)}
+}
+
+// Trunc corta as casas decimais (TRUNC numérico). Para datas, corta a hora.
+func Trunc(x V, n ...V) V {
+	if x.k == KNull {
+		return Null
+	}
+	if x.k == KTime {
+		y, m, d := x.t.Date()
+		return Time(time.Date(y, m, d, 0, 0, 0, 0, x.t.Location()))
+	}
+	places := int64(0)
+	if len(n) > 0 {
+		p := num(n[0], "TRUNC")
+		places = new(big.Int).Quo(p.Num(), p.Denom()).Int64()
+	}
+	return V{k: KNum, n: roundRat(num(x, "TRUNC"), places, false)}
+}
+
+func roundRat(r *big.Rat, places int64, halfUp bool) *big.Rat {
+	scale := new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(abs64(places)), nil))
+	v := new(big.Rat).Set(r)
+	if places >= 0 {
+		v.Mul(v, scale)
+	} else {
+		v.Quo(v, scale)
+	}
+	neg := v.Sign() < 0
+	v.Abs(v)
+	q, rem := new(big.Int).QuoRem(v.Num(), v.Denom(), new(big.Int))
+	if halfUp {
+		// rem/denom >= 1/2  <=>  2*rem >= denom
+		if new(big.Int).Mul(rem, big.NewInt(2)).Cmp(v.Denom()) >= 0 {
+			q.Add(q, big.NewInt(1))
+		}
+	}
+	out := new(big.Rat).SetInt(q)
+	if neg {
+		out.Neg(out)
+	}
+	if places >= 0 {
+		out.Quo(out, scale)
+	} else {
+		out.Mul(out, scale)
+	}
+	return out
+}
+
+func abs64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// Abs é o valor absoluto.
+func Abs(x V) V {
+	if x.k == KNull {
+		return Null
+	}
+	return V{k: KNum, n: new(big.Rat).Abs(num(x, "ABS"))}
+}
+
+// Mod é o resto (sinal do dividendo; MOD(x, 0) = x, como no Oracle).
+func Mod(a, b V) V {
+	if a.k == KNull || b.k == KNull {
+		return Null
+	}
+	x, y := num(a, "MOD"), num(b, "MOD")
+	if y.Sign() == 0 {
+		return a
+	}
+	q := new(big.Rat).Quo(x, y)
+	t := roundRat(q, 0, false)
+	return V{k: KNum, n: new(big.Rat).Sub(x, new(big.Rat).Mul(y, t))}
+}
+
+// Greatest devolve o maior (NULL se algum for NULL, como no Oracle).
+func Greatest(vs ...V) V { return pick(vs, func(c int) bool { return c > 0 }) }
+
+// Least devolve o menor (NULL se algum for NULL).
+func Least(vs ...V) V { return pick(vs, func(c int) bool { return c < 0 }) }
+
+func pick(vs []V, better func(int) bool) V {
+	if len(vs) == 0 {
+		return Null
+	}
+	best := vs[0]
+	for _, v := range vs {
+		if v.k == KNull {
+			return Null
+		}
+		if c, _ := compare(v, best, "GREATEST/LEAST"); better(c) {
+			best = v
+		}
+	}
+	return best
+}
+
+// Upper, Lower, Trim, Length e Substr como no Oracle.
+func Upper(x V) V {
+	if x.k == KNull {
+		return Null
+	}
+	return Str(strings.ToUpper(x.Text()))
+}
+
+func Lower(x V) V {
+	if x.k == KNull {
+		return Null
+	}
+	return Str(strings.ToLower(x.Text()))
+}
+
+func Trim(x V) V {
+	if x.k == KNull {
+		return Null
+	}
+	return Str(strings.TrimSpace(x.Text()))
+}
+
+func Length(x V) V {
+	if x.k == KNull {
+		return Null
+	}
+	return Int(int64(len([]rune(x.Text()))))
+}
+
+// Substr usa posição 1-based; posição negativa conta do fim.
+func Substr(x V, args ...V) V {
+	if x.k == KNull || len(args) == 0 || args[0].k == KNull {
+		return Null
+	}
+	rs := []rune(x.Text())
+	p := num(args[0], "SUBSTR")
+	pos := int(new(big.Int).Quo(p.Num(), p.Denom()).Int64())
+	if pos == 0 {
+		pos = 1
+	}
+	if pos < 0 {
+		pos = len(rs) + pos + 1
+	}
+	if pos < 1 || pos > len(rs) {
+		return Null
+	}
+	end := len(rs)
+	if len(args) > 1 {
+		if args[1].k == KNull {
+			return Null
+		}
+		l := num(args[1], "SUBSTR")
+		n := int(new(big.Int).Quo(l.Num(), l.Denom()).Int64())
+		if n < 1 {
+			return Null
+		}
+		if pos-1+n < end {
+			end = pos - 1 + n
+		}
+	}
+	return Str(string(rs[pos-1 : end]))
+}
+
+// ToNumber converte texto em número.
+func ToNumber(x V) V {
+	if x.k == KNull {
+		return Null
+	}
+	return V{k: KNum, n: num(x, "TO_NUMBER")}
+}
+
+// ToChar converte em texto (sem máscara).
+func ToChar(x V) V {
+	if x.k == KNull {
+		return Null
+	}
+	return Str(x.Text())
+}
+
+// Sysdate é a data/hora atual (pode ser trocada nos testes).
+var Sysdate = func() V { return Time(time.Now().Truncate(time.Second)) }
+
+// Unsupported é chamada no lugar de funções do Oracle que o gerador ainda não traduz.
+func Unsupported(name string) V {
+	fail("função %s do Oracle não traduzida para Go", name)
+	return Null
+}
+
+// ---------------------------------------------------------------- linhas e parâmetros
+
+// Row é a entrada das regras: valor por nome ("TABELA.COLUNA" ou ":PARAMETRO").
+type Row interface {
+	Get(name string) V
+}
+
+// Map é um Row simples.
+type Map map[string]V
+
+// Get devolve o valor do nome, ou NULL se ausente.
+func (m Map) Get(name string) V {
+	if v, ok := m[name]; ok {
+		return v
+	}
+	return Null
+}
+
+// ---------------------------------------------------------------- conexão
+
+var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?}`)
+
+// Expand resolve ${VAR} e ${VAR:-padrão} com as variáveis de ambiente.
+func Expand(s string) string {
+	return envRef.ReplaceAllStringFunc(s, func(m string) string {
+		g := envRef.FindStringSubmatch(m)
+		if v := os.Getenv(g[1]); v != "" {
+			return v
+		}
+		return g[3]
+	})
+}

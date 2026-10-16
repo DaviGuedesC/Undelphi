@@ -1,0 +1,132 @@
+// Código gerado pelo undelphi. NÃO EDITAR: é recriado a cada geração.
+
+package {{PKG}}
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+
+	"{{MODULE}}/undelphirt"
+)
+
+// Requisicao é o que a tela Vue gerada manda em POST <base>/eventos/<handler>.
+type Requisicao struct {
+	Form    map[string]any            `json:"form"`
+	Abas    map[string]any            `json:"abas"`
+	Selecao map[string]map[string]any `json:"selecao"`
+}
+
+// Valor procura um campo pelo nome, sem diferenciar maiúsculas: primeiro no form, depois na linha
+// selecionada de cada grade. Devolve nil se não achar.
+func (r *Requisicao) Valor(nome string) any {
+	if r == nil {
+		return nil
+	}
+	for k, v := range r.Form {
+		if strings.EqualFold(k, nome) {
+			return vazioNil(v)
+		}
+	}
+	for _, linha := range r.Selecao {
+		for k, v := range linha {
+			if strings.EqualFold(k, nome) {
+				return vazioNil(v)
+			}
+		}
+	}
+	return nil
+}
+
+// vazioNil trata texto vazio como NULL, como o Oracle.
+func vazioNil(v any) any {
+	if s, ok := v.(string); ok && s == "" {
+		return nil
+	}
+	return v
+}
+
+// Resposta é o que a tela aplica: mensagem ou erro, campos do form, dados das grades, listas e abas.
+type Resposta struct {
+	Mensagem string         `json:"mensagem,omitempty"`
+	Erro     string         `json:"erro,omitempty"`
+	Form     map[string]any `json:"form,omitempty"`
+	Dados    map[string]any `json:"dados,omitempty"`
+	Listas   map[string]any `json:"listas,omitempty"`
+	Abas     map[string]any `json:"abas,omitempty"`
+}
+
+// NovaResposta devolve uma resposta vazia, pronta para preencher.
+func NovaResposta() *Resposta {
+	return &Resposta{Form: map[string]any{}, Dados: map[string]any{}, Listas: map[string]any{}, Abas: map[string]any{}}
+}
+
+// Falha registra o erro na resposta (a tela mostra em vermelho).
+func (r *Resposta) Falha(err error) *Resposta {
+	r.Erro = err.Error()
+	return r
+}
+
+// linhasJSON transforma as linhas do queryAll em objetos COLUNA → valor.
+func linhasJSON(cols []string, rows [][]undelphirt.V) []undelphirt.Map {
+	out := make([]undelphirt.Map, 0, len(rows))
+	for _, v := range rows {
+		out = append(out, asMap(cols, v))
+	}
+	return out
+}
+
+// Evento é um handler convertido do Delphi.
+type Evento func(ctx context.Context, req *Requisicao) (*Resposta, error)
+
+// Consulta devolve as linhas de uma grade; q são os parâmetros da query string (os campos do form).
+type Consulta func(ctx context.Context, q *Requisicao) (any, error)
+
+func registrarEvento(mux *http.ServeMux, rota string, h Evento) {
+	mux.HandleFunc("POST "+rota, func(w http.ResponseWriter, r *http.Request) {
+		var req Requisicao
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			escrever(w, http.StatusBadRequest, &Resposta{Erro: "requisição inválida: " + err.Error()})
+			return
+		}
+		resp, err := h(r.Context(), &req)
+		if err != nil {
+			escrever(w, status(err), &Resposta{Erro: err.Error()})
+			return
+		}
+		escrever(w, http.StatusOK, resp)
+	})
+}
+
+func registrarDados(mux *http.ServeMux, rota string, c Consulta) {
+	mux.HandleFunc("GET "+rota, func(w http.ResponseWriter, r *http.Request) {
+		req := &Requisicao{Form: map[string]any{}}
+		for k, v := range r.URL.Query() {
+			if len(v) > 0 {
+				req.Form[k] = v[0]
+			}
+		}
+		linhas, err := c(r.Context(), req)
+		if err != nil {
+			escrever(w, status(err), map[string]string{"erro": err.Error()})
+			return
+		}
+		escrever(w, http.StatusOK, linhas)
+	})
+}
+
+// status: lacuna no destino = 501 (não implementado), resto = 500.
+func status(err error) int {
+	if errors.Is(err, undelphirt.ErrLacuna) {
+		return http.StatusNotImplemented
+	}
+	return http.StatusInternalServerError
+}
+
+func escrever(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}

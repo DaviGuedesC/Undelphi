@@ -1,0 +1,64 @@
+package pcnov9860
+
+import (
+	"encoding/csv"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	"teste/gerado/undelphirt"
+)
+
+// Roda a regra PUNIT gerada a partir do exe sobre os itens das 10 notas e grava o resultado
+// (item;variante;punit) para o teste Java comparar com a referência e com o ERP.
+func TestValidacaoPunit9860(t *testing.T) {
+	f, err := os.Open("../punit_9860_10_notas.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	recs, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := map[string]int{}
+	for i, h := range recs[0] {
+		head[h] = i
+	}
+	num := func(row []string, col string) undelphirt.V {
+		s := strings.TrimSpace(row[head[col]])
+		if s == "" {
+			return undelphirt.Null
+		}
+		return undelphirt.Num(s)
+	}
+	var out strings.Builder
+	for _, row := range recs[1:] {
+		for _, variante := range []string{"vuncom", "vuncom_rateado"} {
+			in := undelphirt.Map{
+				"NFE_ITENS.IPI_VIPI":     num(row, "vipi"),
+				"NFE_ITENS.PROD_QCOM":    num(row, "qcom"),
+				"NFE_ITENS.PROD_VUNCOM":  num(row, variante),
+				"NFE_ITENS.ICMS_VICMSST": num(row, "vicmsst"),
+				"NFE_ITENS.PROD_VDESC":   num(row, "vdesc"),
+				"NFE_ITENS.FATOR":        num(row, "fator_erp"),
+				":PRECOXMLUSANDOFATOR":   undelphirt.Str("S"),
+			}
+			for _, nome := range RegraDmdadosxmlExeGerarPCCOTAPunitEntradas {
+				if _, ok := in[nome]; !ok {
+					t.Fatalf("a regra gerada pede a entrada %q, que o teste não fornece", nome)
+				}
+			}
+			v, err := RegraDmdadosxmlExeGerarPCCOTAPunit(in)
+			res := v.Text()
+			if err != nil {
+				res = "ERRO:" + err.Error()
+			}
+			fmt.Fprintf(&out, "%s;%s;%s\n", row[head["item"]], variante, res)
+		}
+	}
+	if err := os.WriteFile("../resultado_go.txt", []byte(out.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

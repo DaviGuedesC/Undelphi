@@ -1,0 +1,113 @@
+package undelphirt
+
+import (
+	"errors"
+	"testing"
+)
+
+func eval(f func() V) (v V, err error) {
+	defer Recover(&err)
+	return f(), nil
+}
+
+func TestRoundMeioParaLongeDoZero(t *testing.T) {
+	cases := map[string]string{"2.675": "2.68", "-2.675": "-2.68", "2.665": "2.67", "1.005": "1.01", "-0.5": "-1"}
+	for in, want := range cases {
+		places := Num("2")
+		if in == "-0.5" {
+			places = Num("0")
+		}
+		if got := Round(Num(in), places).Text(); got != want {
+			t.Errorf("ROUND(%s) = %s, quero %s", in, got, want)
+		}
+	}
+	if got := Trunc(Num("-2.679"), Num("2")).Text(); got != "-2.67" {
+		t.Errorf("TRUNC = %s", got)
+	}
+}
+
+func TestDecimalExatoSemErroDeFloat(t *testing.T) {
+	if got := Add(Num("0.1"), Num("0.2")).Text(); got != "0.3" {
+		t.Errorf("0.1+0.2 = %s", got)
+	}
+	if got := Round(Div(Num("10"), Num("3")), Num("4")).Text(); got != "3.3333" {
+		t.Errorf("10/3 = %s", got)
+	}
+}
+
+func TestDivisaoPorZeroEhErro(t *testing.T) {
+	_, err := eval(func() V { return Div(Num("1"), Num("0")) })
+	var se *SQLError
+	if !errors.As(err, &se) {
+		t.Fatalf("esperava SQLError, veio %v", err)
+	}
+}
+
+func TestNullSePropagaEVazioEhNull(t *testing.T) {
+	if !Add(Null, Num("1")).IsNull() || !Mul(Num("2"), Null).IsNull() {
+		t.Error("NULL deveria se propagar")
+	}
+	if !Str("").IsNull() {
+		t.Error("'' deveria ser NULL")
+	}
+	if Concat(Null, Str("a")).Text() != "a" {
+		t.Error("|| deveria ignorar NULL")
+	}
+}
+
+func TestLogicaDeTresValores(t *testing.T) {
+	if !Eq(Null, Null).IsNull() {
+		t.Error("NULL = NULL deveria ser NULL")
+	}
+	if Truth(Eq(Null, Null)) {
+		t.Error("NULL = NULL não é verdadeiro")
+	}
+	if !Truth(Not(And(Bool(false), Null))) {
+		t.Error("FALSE AND NULL = FALSE")
+	}
+	if !Truth(Or(Bool(true), Null)) {
+		t.Error("TRUE OR NULL = TRUE")
+	}
+	if !Truth(Eq(Str("10"), Num("10.0"))) {
+		t.Error("'10' = 10 deveria converter o texto em número")
+	}
+}
+
+func TestDecodeNvlCoalesce(t *testing.T) {
+	if Decode(Null, Null, Str("nulo"), Str("outro")).Text() != "nulo" {
+		t.Error("DECODE casa NULL com NULL")
+	}
+	if Decode(Num("0"), Num("0"), Num("1"), Num("9")).Text() != "1" {
+		t.Error("DECODE(0,0,1,x)")
+	}
+	if Decode(Num("5"), Num("0"), Num("1")).IsNull() == false {
+		t.Error("DECODE sem padrão devolve NULL")
+	}
+	if Nvl(Null, Num("2")).Text() != "2" || Coalesce(Null, Null, Str("x")).Text() != "x" {
+		t.Error("NVL/COALESCE")
+	}
+	if !Greatest(Num("1"), Null).IsNull() {
+		t.Error("GREATEST com NULL é NULL no Oracle")
+	}
+}
+
+func TestSubstrLikeMod(t *testing.T) {
+	if Substr(Str("ABCDEF"), Num("2"), Num("3")).Text() != "BCD" || Substr(Str("ABCDEF"), Num("-2")).Text() != "EF" {
+		t.Error("SUBSTR")
+	}
+	if !Truth(Like(Str("PCPRODUT"), Str("PC%T"))) || Truth(Like(Str("X"), Str("_Y"))) {
+		t.Error("LIKE")
+	}
+	if Mod(Num("-7"), Num("3")).Text() != "-1" || Mod(Num("7"), Num("0")).Text() != "7" {
+		t.Error("MOD")
+	}
+}
+
+func TestOfLeValoresDoBanco(t *testing.T) {
+	if Of([]byte("12.50")).Kind() != KNum || Of([]byte("ABC")).Kind() != KStr || !Of(nil).IsNull() {
+		t.Error("Of")
+	}
+	if Of(int64(3)).Text() != "3" || Of(1.25).Text() != "1.25" {
+		t.Error("Of numérico")
+	}
+}
